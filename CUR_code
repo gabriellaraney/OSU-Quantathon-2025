@@ -1,0 +1,81 @@
+import pandas as pd
+import numpy as np
+from hmmlearn import hmm
+
+# ---------------------------
+# Step 1. Load the combined dataset
+# ---------------------------
+df = pd.read_csv("Combined_SPX_Data.csv", parse_dates=["Date"])
+
+# Ensure the underlying price column is numeric.
+df["PX_LAST"] = pd.to_numeric(df["S&P500"], errors="coerce")
+
+# ---------------------------
+# Step 2. Compute Returns
+# ---------------------------
+# Calculate the daily return based on PX_LAST.
+df["Return"] = df["PX_LAST"].pct_change()
+
+# Define a horizon (in trading days) for future return calculation; here we use 21 days (~1 month).
+horizon = 21
+df["Future_Return"] = df["PX_LAST"].shift(-horizon) / df["PX_LAST"] - 1
+
+# Remove the last 'horizon' rows (as future return cannot be computed there)
+df = df.dropna(subset=["Future_Return"])
+
+# ---------------------------
+# Step 3. Fit the HMM using probability features
+# ---------------------------
+# Ensure the probability columns are numeric
+df["PrDec"] = pd.to_numeric(df["PrDec"], errors="coerce")
+df["PrInc"] = pd.to_numeric(df["PrInc"], errors="coerce")
+
+# Use the probability columns as features.
+X = df[["PrDec", "PrInc"]].values
+
+# Fit a Gaussian HMM with three states.
+model = hmm.GaussianHMM(n_components=3, covariance_type="full", n_iter=1000, random_state=42)
+model.fit(X)
+
+# Predict the hidden state for each observation (day).
+df["HMM_State"] = model.predict(X)
+
+# ---------------------------
+# Step 4. Optimize the state labeling based on future returns
+# ---------------------------
+# Compute the average future return for each state.
+state_avg_return = df.groupby("HMM_State")["Future_Return"].mean()
+
+# Rank the states by their average future return.
+sorted_states = state_avg_return.sort_values()
+
+# Assign labels based on ranking:
+# - Lowest average future return => "Bearish"
+# - Highest average future return => "Bullish"
+# - Middle => "Neutral"
+state_label_map = {}
+if len(sorted_states) == 3:
+    state_label_map[sorted_states.index[0]] = "Bearish"
+    state_label_map[sorted_states.index[1]] = "Neutral"
+    state_label_map[sorted_states.index[2]] = "Bullish"
+else:
+    ranked = sorted_states.rank(method="first")
+    for s, r in ranked.items():
+        if r == 1:
+            state_label_map[s] = "Bearish"
+        elif r == ranked.max():
+            state_label_map[s] = "Bullish"
+        else:
+            state_label_map[s] = "Neutral"
+
+# Map the optimized labels to a new column.
+df["Optimized_State"] = df["HMM_State"].map(state_label_map)
+
+# ---------------------------
+# Step 5. Output the results
+# ---------------------------
+result = df[["Date", "Optimized_State", "Future_Return", "PX_LAST"]]
+print(result.head(50))
+
+# Save the result to CSV.
+result.to_csv("HMM_Optimized_States.csv", index=False)
