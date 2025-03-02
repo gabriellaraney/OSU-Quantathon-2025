@@ -19,7 +19,7 @@ data['Date'] = pd.to_datetime(data['Date'])
 data['S&P500_Return'] = data['S&P500'].pct_change()
 data = data.dropna() 
 
-# isolate key features for regime distinction
+# Fisolate key features for regime distinction
 features = ['S&P500_Return', 'PrDec', 'PrInc']
 
 # preprocess the data
@@ -92,11 +92,9 @@ else:
     
     # backtest the trading strategy
     
-    # CORRECT BOND RATES
+    # get bond rate
     if 'Bond Rate' in data.columns:
-        data['Cash_Return'] = data['Bond Rate'] / 252  # Daily rate
-    else:
-        data['Cash_Return'] = 0.02 / 252  # Assume 2% annual return for cash, converted to daily
+        data['Cash_Return'] = data['Bond Rate'] / 252  # daily rate
     
     # Initialize portfolio values
     initial_investment = 100000
