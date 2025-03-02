@@ -1,0 +1,285 @@
+# HMM for portfolio optimization with options
+
+# import libraries 
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from hmmlearn import hmm
+from sklearn.preprocessing import StandardScaler
+from matplotlib.ticker import FuncFormatter
+
+# declare variables
+option_allocation = 0.10 
+TRADING_DAYS = 252 
+
+def black_scholes_call(S, K, T, r, sigma):
+    if T <= 0:
+        return max(S - K, 0)
+    d1 = (np.log(S/K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+
+
+# load dataset
+data = pd.read_csv('Combined_SPX_Data_3.csv')
+
+# convert date columns to datetime format
+data['Date'] = pd.to_datetime(data['Date'])
+data.sort_values('Date', inplace=True)
+
+# calculate daily returns from S&P500 price
+data['S&P500_Return'] = data['S&P500'].pct_change()
+data = data.dropna()
+
+# simulation trading day calculator
+data = data.reset_index(drop=True)
+data['Day'] = np.arange(len(data))
+
+# isolate key features for regime distinction
+features = ['S&P500_Return', 'PrDec', 'PrInc']
+
+# preprocess data
+scaler = StandardScaler()
+scaled_data = scaler.fit_transform(data[features])
+
+# train HMM models with multiple starts
+def train_hmm(X, n_states=2, n_attempts=20):
+    best_model = None
+    best_score = float('-inf')
+    for i in range(n_attempts):
+        model = hmm.GaussianHMM(n_components=n_states,
+                                covariance_type="full",
+                                n_iter=1000,
+                                tol=1e-4,
+                                random_state=i*42,
+                                init_params="mcw")
+        try:
+            model.fit(X)
+            score = model.score(X)
+            if score > best_score:
+                best_score = score
+                best_model = model
+        except Exception as e:
+            continue
+    return best_model, best_score
+
+# train the HMM model with 2 states
+n_states = 2
+best_model, best_score = train_hmm(scaled_data, n_states=n_states, n_attempts=10)
+
+# decode the hidden states
+hidden_states = best_model.predict(scaled_data)
+
+# add the hidden states to the dataframe
+data['Regime'] = hidden_states
+
+# strategy definition
+regime_strategy = {}
+for i in range(n_states):
+    regime_data = data[data['Regime'] == i]
+    ratio = regime_data['PrDec'].mean() / regime_data['PrInc'].mean() if regime_data['PrInc'].mean() != 0 else 1
+    regime_strategy[i] = "BUY_CALL" if ratio > 1.2 else "BUY_PUT"
+data['Strategy'] = data['Regime'].map(regime_strategy)
+if 'Bond Rate' not in data.columns:
+    data['Bond Rate'] = 0.02
+
+# shading regions
+def add_shading(ax, df):
+    colors = {0: 'lightcoral', 1: 'lightgreen'}
+    labeled = {}
+    # group data by periods
+    for _, group in df.groupby((df['Regime'] != df['Regime'].shift()).cumsum()):
+        start_date = group['Date'].iloc[0]
+        end_date = group['Date'].iloc[-1]
+        regime = group['Regime'].iloc[0]
+        label = f"Regime {regime}" if regime not in labeled else None
+        if label is not None:
+            labeled[regime] = True
+        ax.axvspan(start_date, end_date, color=colors.get(regime, 'grey'), alpha=0.2, label=label)
+
+# back testing
+initial_investment = 100000
+portfolio_value = initial_investment
+
+# declare columns
+data['Option_Portfolio'] = np.nan
+data['Stock_Value'] = np.nan
+data['Option_Value'] = np.nan
+
+# variables for option overlay (BUY_CALL)
+active_option = False
+option_strike = None
+option_quantity = 0
+option_expires = None 
+stock_value = 0
+
+# trading day counter used for 'Day' column.
+for i, row in data.iterrows():
+    current_day = row['Day']
+    S = row['S&P500']
+    sp_return = row['S&P500_Return']
+    bond_rate = row['Bond Rate']
+    strategy = row['Strategy']
+    iv_call = row['IVOL_CALL_12M_MOV_AVG_30D_HIST'] / 100 
+
+    # using Black Scholes and updating variables
+    if strategy == "BUY_CALL":
+        if not active_option:
+            stock_value = 0.90 * portfolio_value
+            option_alloc = 0.10 * portfolio_value
+            option_price = black_scholes_call(S, S, 1, bond_rate, iv_call)
+            option_quantity = option_alloc / option_price if option_price > 0 else 0
+            option_strike = S
+            option_expires = current_day + TRADING_DAYS
+            active_option = True
+            option_value = option_quantity * option_price
+        else:
+            stock_value = stock_value * (1 + sp_return)
+            days_remaining = max(0, option_expires - current_day)
+            T_remaining = days_remaining / TRADING_DAYS
+            option_price = black_scholes_call(S, option_strike, T_remaining, bond_rate, iv_call)
+            option_value = option_quantity * option_price
+            if days_remaining <= 0:
+                intrinsic = max(S - option_strike, 0)
+                option_value = option_quantity * intrinsic
+                stock_value += option_value
+                active_option = False
+                option_quantity = 0
+                option_strike = None
+                option_expires = None
+        portfolio_value = stock_value + (option_value if active_option else 0)
+    else:
+        if active_option:
+            days_remaining = max(0, option_expires - current_day)
+            T_remaining = days_remaining / TRADING_DAYS
+            option_price = black_scholes_call(S, option_strike, T_remaining, bond_rate, iv_call) if T_remaining > 0 else max(S - option_strike, 0)
+            option_value = option_quantity * option_price
+            portfolio_value = stock_value + option_value
+            active_option = False
+            option_quantity = 0
+            option_strike = None
+            option_expires = None
+        portfolio_value = portfolio_value * (1 + bond_rate/252)
+        stock_value = 0
+        option_value = 0
+
+    data.loc[i, 'Option_Portfolio'] = portfolio_value
+    data.loc[i, 'Stock_Value'] = stock_value
+    data.loc[i, 'Option_Value'] = option_value
+
+# calculate cumulative trading returns
+cumulative_return = (1 + data['S&P500_Return']).cumprod()
+data['BuyHold_Portfolio'] = initial_investment * cumulative_return
+
+# calculate drawdowns for both strategies
+data['BuyHold_Peak'] = data['BuyHold_Portfolio'].cummax()
+data['BuyHold_Drawdown'] = (data['BuyHold_Portfolio'] / data['BuyHold_Peak'] - 1) * 100
+
+data['Option_Peak'] = data['Option_Portfolio'].cummax()
+data['Option_Drawdown'] = (data['Option_Portfolio'] / data['Option_Peak'] - 1) * 100
+
+bh_total_return = (data['BuyHold_Portfolio'].iloc[-1] / initial_investment - 1) * 100
+op_total_return = (data['Option_Portfolio'].iloc[-1] / initial_investment - 1) * 100
+
+# trading metrics
+annual_bond_rate = data['Bond Rate'].iloc[0]
+daily_bond_rate = (1 + annual_bond_rate)**(1/252) - 1
+
+# daily returns
+data['BuyHold_daily'] = data['BuyHold_Portfolio'].pct_change()
+data['Option_daily'] = data['Option_Portfolio'].pct_change()
+
+# excess returns
+data['BuyHold_excess'] = data['BuyHold_daily'] - daily_bond_rate
+data['Option_excess'] = data['Option_daily'] - daily_bond_rate
+
+# Sharpe Ratios (annualized)
+sharpe_bh = (data['BuyHold_excess'].mean() / data['BuyHold_excess'].std()) * np.sqrt(252)
+sharpe_op = (data['Option_excess'].mean() / data['Option_excess'].std()) * np.sqrt(252)
+
+# downside standard deviation (for Sortino Ratio)
+downside_bh = data['BuyHold_excess'][data['BuyHold_excess'] < 0]
+downside_std_bh = downside_bh.std()
+
+downside_op = data['Option_excess'][data['Option_excess'] < 0]
+downside_std_op = downside_op.std()
+
+sortino_bh = (data['BuyHold_excess'].mean() / downside_std_bh) * np.sqrt(252)
+sortino_op = (data['Option_excess'].mean() / downside_std_op) * np.sqrt(252)
+
+# maximum drawdowns
+max_drawdown_bh = data['BuyHold_Drawdown'].min()
+max_drawdown_op = data['Option_Drawdown'].min()
+
+# return v. benchmark
+relative_return = op_total_return - bh_total_return
+
+# performance metrics
+print("Performance Metrics:")
+print(f"Buy-and-Hold Total Return: {bh_total_return:.2f}%")
+print(f"Option Total Return: {op_total_return:.2f}%")
+print(f"Benchmark (Buy-and-Hold) Return: {bh_total_return:.2f}%")
+print(f"Return vs Benchmark: {relative_return:.2f}%")
+print()
+
+# sharpe ratios
+print("Sharpe Ratios:")
+print(f"Buy-and-Hold Sharpe Ratio: {sharpe_bh:.2f}")
+print(f"Option Sharpe Ratio: {sharpe_op:.2f}")
+print()
+
+# sortino ratios
+print("Sortino Ratios:")
+print(f"Buy-and-Hold Sortino Ratio: {sortino_bh:.2f}")
+print(f"Option Sortino Ratio: {sortino_op:.2f}")
+print()
+
+# maximum drawdowns
+print("Maximum Drawdowns:")
+print(f"Buy-and-Hold Max Drawdown: {max_drawdown_bh:.2f}%")
+print(f"Option Max Drawdown: {max_drawdown_op:.2f}%")
+
+
+# Plot 1: Portfolio Value Comparison
+plt.figure(figsize=(10, 6))
+ax = plt.gca()
+ax.plot(data['Date'], data['BuyHold_Portfolio'], label='Buy-and-Hold', color='blue')
+ax.plot(data['Date'], data['Option_Portfolio'], label='Option', color='green')
+add_shading(ax, data)
+ax.set_title('Portfolio Value Comparison (Options)')
+ax.set_xlabel('Date')
+ax.set_ylabel('Portfolio Value')
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.show()
+
+# Plot 2: Comparable Drawdowns
+plt.figure(figsize=(10, 6))
+ax = plt.gca()
+ax.plot(data['Date'], data['BuyHold_Drawdown'], label='Buy-and-Hold Drawdown', color='blue')
+ax.plot(data['Date'], data['Option_Drawdown'], label='Option Drawdown', color='red')
+add_shading(ax, data)
+ax.set_title('Comparable Drawdowns (Options)')
+ax.set_xlabel('Date')
+ax.set_ylabel('Drawdown (%)')
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.show()
+
+# Plot 3: Relative Outperformance
+relative_outperformance = (data['Option_Portfolio'] / data['BuyHold_Portfolio'] - 1) * 100
+plt.figure(figsize=(10, 6))
+ax = plt.gca()
+ax.plot(data['Date'], relative_outperformance, label='Relative Outperformance (%)', color='purple')
+ax.axhline(0, color='black', linestyle='--', linewidth=1)
+add_shading(ax, data)
+ax.set_title('Trading Outperformance (Options)')
+ax.set_xlabel('Date')
+ax.set_ylabel('Relative Outperformance (%)')
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.show()
+
+# save results to CSV
+data['S&P500_Price'] = data['S&P500']
+data.to_csv('option_backtest_results.csv', index=False)
