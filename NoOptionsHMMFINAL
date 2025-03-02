@@ -19,7 +19,7 @@ data['Date'] = pd.to_datetime(data['Date'])
 data['S&P500_Return'] = data['S&P500'].pct_change()
 data = data.dropna() 
 
-# Fisolate key features for regime distinction
+# isolate key features for regime distinction
 features = ['S&P500_Return', 'PrDec', 'PrInc']
 
 # preprocess the data
@@ -96,7 +96,7 @@ else:
     if 'Bond Rate' in data.columns:
         data['Cash_Return'] = data['Bond Rate'] / 252  # daily rate
     
-    # Initialize portfolio values
+    # initialize portfolio values
     initial_investment = 100000
     
     # create columns
@@ -226,8 +226,8 @@ else:
     
     # Plot 2: Drawdowns
     plt.subplot(3, 1, 2)
-    plt.plot(data['Date'], data['BuyHold_Drawdown'], label='Buy-and-Hold Drawdown', color='red')
-    plt.plot(data['Date'], data['Trading_Drawdown'], label='Trading Drawdown', color='orange')
+    plt.plot(data['Date'], data['BuyHold_Drawdown'], label='Buy-and-Hold Drawdown', color='blue')
+    plt.plot(data['Date'], data['Trading_Drawdown'], label='Trading Drawdown', color='red')
     plt.title('Drawdown Comparison')
     plt.ylabel('Drawdown (%)')
     plt.legend()
