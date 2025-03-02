@@ -1,0 +1,280 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from hmmlearn import hmm
+from sklearn.preprocessing import StandardScaler
+import seaborn as sns
+from matplotlib.ticker import FuncFormatter
+import warnings
+warnings.filterwarnings('ignore')
+
+# Load the full dataset
+print("Loading dataset...")
+data = pd.read_csv('Combined_SPX_Data_3.csv')
+
+# Convert date columns to datetime format for better plotting
+data['Date'] = pd.to_datetime(data['Date'])
+
+# Basic data exploration
+print(f"Dataset spans from {data['Date'].min()} to {data['Date'].max()}")
+print(f"Total number of trading days: {len(data)}")
+
+# Handle missing values if necessary
+missing_values = data.isnull().sum()
+if missing_values.sum() > 0:
+    print("Handling missing values...")
+    data = data.fillna(method='ffill').fillna(method='bfill')
+
+# Calculate daily returns from S&P500 price
+data['S&P500_Return'] = data['S&P500'].pct_change()
+data = data.dropna()  # Remove the first row with NaN from pct_change
+
+# Focus on the key features for regime detection
+features = ['S&P500_Return', 'PrDec', 'PrInc']
+
+# Preprocess the data
+print("Normalizing features...")
+scaler = StandardScaler()
+scaled_data = scaler.fit_transform(data[features])
+
+# Define function to train HMM models with multiple starts
+def train_hmm_with_multiple_starts(X, n_states=2, n_attempts=20):
+    best_model = None
+    best_score = float('-inf')
+    
+    print(f"Training HMM with {n_states} states, making {n_attempts} attempts...")
+    
+    for i in range(n_attempts):
+        model = hmm.GaussianHMM(
+            n_components=n_states, 
+            covariance_type="full", 
+            n_iter=1000,
+            tol=1e-4,
+            random_state=i*42,
+            init_params="mcw"
+        )
+        
+        try:
+            model.fit(X)
+            score = model.score(X)
+            
+            if score > best_score:
+                best_score = score
+                best_model = model
+                
+            print(f"Attempt {i+1}: Log-likelihood {score:.2f} - {'Success' if model.monitor_.converged else 'Not converged'}")
+            
+        except Exception as e:
+            print(f"Attempt {i+1} failed: {str(e)}")
+    
+    return best_model, best_score
+
+# Train the HMM model with 2 states
+n_states = 2
+print(f"\nTraining final model with {n_states} states...")
+best_model, best_score = train_hmm_with_multiple_starts(scaled_data, n_states=n_states, n_attempts=10)
+
+if best_model is None:
+    print("Failed to train a converging model.")
+else:
+    print(f"Best model log-likelihood: {best_score:.2f}")
+    
+    # Decode the hidden states
+    hidden_states = best_model.predict(scaled_data)
+    
+    # Add the hidden states to the dataframe
+    data['Regime'] = hidden_states
+    
+    # Analyze the characteristics of each regime
+    print("\nRegime Analysis:")
+    for i in range(best_model.n_components):
+        regime_data = data[data['Regime'] == i]
+        print(f"\nRegime {i} ({len(regime_data)} days):")
+        print(f"  Avg S&P500 Return: {regime_data['S&P500_Return'].mean():.4f}")
+        print(f"  Annualized Return: {regime_data['S&P500_Return'].mean() * 252:.4f}")
+        print(f"  Annualized Volatility: {regime_data['S&P500_Return'].std() * np.sqrt(252):.4f}")
+        print(f"  Avg PrDec: {regime_data['PrDec'].mean():.4f}")
+        print(f"  Avg PrInc: {regime_data['PrInc'].mean():.4f}")
+    
+    # Get transition matrix
+    print("\nTransition Matrix:")
+    print(pd.DataFrame(
+        best_model.transmat_,
+        index=[f'From Regime {i}' for i in range(best_model.n_components)],
+        columns=[f'To Regime {i}' for i in range(best_model.n_components)]
+    ))
+    
+    # Calculate regime persistence
+    for i in range(best_model.n_components):
+        persistence = 1 / (1 - best_model.transmat_[i, i])
+        print(f"Expected duration of Regime {i}: {persistence:.1f} days")
+    
+    # Backtest the regime-switching strategy
+    print("\nBacktesting Regime-Switching Strategy vs Buy-and-Hold...")
+    
+    # Assume cash return is the bond rate or a fixed value if bond rate is not available
+    if 'Bond Rate' in data.columns:
+        data['Cash_Return'] = data['Bond Rate'] / 252  # Daily rate
+    else:
+        data['Cash_Return'] = 0.02 / 252  # Assume 2% annual return for cash, converted to daily
+    
+    # Initialize portfolio values
+    initial_investment = 100000
+    
+    # Create columns for portfolio values
+    data['BuyHold_Portfolio'] = initial_investment
+    data['RegimeSwitch_Portfolio'] = initial_investment
+    
+    # Calculate cumulative returns for Buy-and-Hold
+    cumulative_return = (1 + data['S&P500_Return']).cumprod()
+    data['BuyHold_Portfolio'] = initial_investment * cumulative_return
+    
+    # Calculate regime-switching returns
+    # Here we switch the strategies compared to the original approach:
+    # Previously, if PrDec/PrInc ratio > 1.2, we recommended BUY_PUT (market decline).
+    # Now we switch:
+    #   - If ratio > 1.2, we recommend BUY_CALL.
+    #   - If ratio < 0.8, we recommend BUY_PUT.
+    #   - Otherwise, HOLD_CASH.
+    
+    # Define regime returns based on the new switched strategy:
+    data['Regime_Return'] = 0.0
+    # For each regime, compute the average probabilities and assign the new strategy.
+    regime_strategy = {}
+    for i in range(best_model.n_components):
+        regime_data = data[data['Regime'] == i]
+        pr_dec = regime_data['PrDec'].mean()
+        pr_inc = regime_data['PrInc'].mean()
+        ratio = pr_dec / pr_inc
+        
+        # Switch the signals:
+        if ratio > 1.2:
+            # Previously: BUY_PUT; now switch to BUY_CALL.
+            regime_strategy[i] = "BUY_CALL"
+        elif ratio < 0.8:
+            # Previously: BUY_CALL; now switch to BUY_PUT.
+            regime_strategy[i] = "BUY_PUT"
+        else:
+            regime_strategy[i] = "HOLD_CASH"
+        
+        print(f"Regime {i} switched strategy: {regime_strategy[i]}")
+    
+    # For backtesting, assume:
+    #   - BUY_CALL means we are fully invested in the S&P500 (since calls mimic long exposure),
+    #   - BUY_PUT means we are in cash (or a protective asset),
+    #   - HOLD_CASH means we remain in cash.
+    for i in range(best_model.n_components):
+        if regime_strategy[i] == "BUY_CALL":
+            data.loc[data['Regime'] == i, 'Regime_Return'] = data.loc[data['Regime'] == i, 'S&P500_Return']
+        else:
+            data.loc[data['Regime'] == i, 'Regime_Return'] = data.loc[data['Regime'] == i, 'Cash_Return']
+    
+    # Calculate cumulative regime-switching returns
+    regime_cumulative_return = (1 + data['Regime_Return']).cumprod()
+    data['RegimeSwitch_Portfolio'] = initial_investment * regime_cumulative_return
+    
+    # Calculate drawdowns for both strategies
+    data['BuyHold_Peak'] = data['BuyHold_Portfolio'].cummax()
+    data['BuyHold_Drawdown'] = (data['BuyHold_Portfolio'] / data['BuyHold_Peak'] - 1) * 100
+    
+    data['RegimeSwitch_Peak'] = data['RegimeSwitch_Portfolio'].cummax()
+    data['RegimeSwitch_Drawdown'] = (data['RegimeSwitch_Portfolio'] / data['RegimeSwitch_Peak'] - 1) * 100
+    
+    # Calculate performance metrics for Buy-and-Hold
+    bh_total_return = (data['BuyHold_Portfolio'].iloc[-1] / initial_investment - 1) * 100
+    bh_annual_return = ((data['BuyHold_Portfolio'].iloc[-1] / initial_investment) ** (252 / len(data)) - 1) * 100
+    bh_volatility = data['S&P500_Return'].std() * np.sqrt(252) * 100
+    bh_sharpe = bh_annual_return / bh_volatility
+    bh_max_drawdown = data['BuyHold_Drawdown'].min()
+    
+    # Regime-Switching metrics
+    rs_total_return = (data['RegimeSwitch_Portfolio'].iloc[-1] / initial_investment - 1) * 100
+    rs_annual_return = ((data['RegimeSwitch_Portfolio'].iloc[-1] / initial_investment) ** (252 / len(data)) - 1) * 100
+    rs_volatility = data['Regime_Return'].std() * np.sqrt(252) * 100
+    rs_sharpe = rs_annual_return / rs_volatility
+    rs_max_drawdown = data['RegimeSwitch_Drawdown'].min()
+    
+    print("\nPerformance Metrics:")
+    print(f"Time Period: {data['Date'].min().date()} to {data['Date'].max().date()}")
+    print(f"Total Trading Days: {len(data)}")
+    
+    print("\nBuy-and-Hold Strategy:")
+    print(f"  Total Return: {bh_total_return:.2f}%")
+    print(f"  Annualized Return: {bh_annual_return:.2f}%")
+    print(f"  Annualized Volatility: {bh_volatility:.2f}%")
+    print(f"  Sharpe Ratio: {bh_sharpe:.2f}")
+    print(f"  Maximum Drawdown: {bh_max_drawdown:.2f}%")
+    
+    print("\nRegime-Switching Strategy:")
+    print(f"  Total Return: {rs_total_return:.2f}%")
+    print(f"  Annualized Return: {rs_annual_return:.2f}%")
+    print(f"  Annualized Volatility: {rs_volatility:.2f}%")
+    print(f"  Sharpe Ratio: {rs_sharpe:.2f}")
+    print(f"  Maximum Drawdown: {rs_max_drawdown:.2f}%")
+    
+    print("\nStrategy Comparison:")
+    print(f"  Return Difference: {rs_total_return - bh_total_return:.2f}%")
+    print(f"  Volatility Reduction: {bh_volatility - rs_volatility:.2f}%")
+    print(f"  Drawdown Improvement: {bh_max_drawdown - rs_max_drawdown:.2f}%")
+    
+    # Visualize the results
+    plt.figure(figsize=(15, 12))
+    
+    def thousands(x, pos):
+        return f'${x/1000:.0f}k'
+    
+    from matplotlib.ticker import FuncFormatter
+    formatter = FuncFormatter(thousands)
+    
+    # Plot 1: Portfolio Values
+    plt.subplot(3, 1, 1)
+    plt.plot(data['Date'], data['BuyHold_Portfolio'], label='Buy-and-Hold', color='blue')
+    plt.plot(data['Date'], data['RegimeSwitch_Portfolio'], label='Regime-Switching', color='green')
+    plt.title('Portfolio Value Comparison')
+    plt.ylabel('Portfolio Value')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.gca().yaxis.set_major_formatter(formatter)
+    
+    # Add shaded backgrounds for different regimes
+    last_date = None
+    last_regime = None
+    for date, regime in zip(data['Date'], data['Regime']):
+        if last_regime is None:
+            last_regime = regime
+            last_date = date
+        elif regime != last_regime:
+            plt.axvspan(last_date, date, alpha=0.1, color=f'C{last_regime}')
+            last_regime = regime
+            last_date = date
+    if last_date is not None:
+        plt.axvspan(last_date, data['Date'].iloc[-1], alpha=0.1, color=f'C{last_regime}')
+    
+    # Plot 2: Drawdowns
+    plt.subplot(3, 1, 2)
+    plt.plot(data['Date'], data['BuyHold_Drawdown'], label='Buy-and-Hold Drawdown', color='red')
+    plt.plot(data['Date'], data['RegimeSwitch_Drawdown'], label='Regime-Switching Drawdown', color='orange')
+    plt.title('Drawdown Comparison')
+    plt.ylabel('Drawdown (%)')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Plot 3: Relative Performance
+    plt.subplot(3, 1, 3)
+    relative_perf = (data['RegimeSwitch_Portfolio'] / data['BuyHold_Portfolio'] - 1) * 100
+    plt.plot(data['Date'], relative_perf, label='Relative Performance', color='purple')
+    plt.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+    plt.title('Regime-Switching Outperformance')
+    plt.ylabel('Outperformance (%)')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('regime_switching_performance.png', dpi=300)
+    plt.show()
+    
+    # Save results to CSV
+    data.to_csv('regime_switching_backtest_results.csv', index=False)
+    print("\nResults saved to 'regime_switching_backtest_results.csv'")
+    
+    # Additional analysis (e.g., monthly performance, risk-adjusted metrics) can be done similarly.
